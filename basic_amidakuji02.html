@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>あみだくじ</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+      background: Canvas;
+      color: CanvasText;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 12px;
+      padding: 16px;
+    }
+    .panel {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      align-items: end;
+    }
+    label { font-size: 12px; opacity: .8; display: block; margin-bottom: 4px; }
+    input, button, select { font: inherit; padding: 8px; }
+    input[type="range"] { width: 100%; }
+    .row { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+    .full { grid-column: 1 / -1; }
+    #wrap { border: 1px solid color-mix(in oklab, CanvasText 20%, transparent);
+            border-radius: 10px; padding: 8px; background: color-mix(in oklab, Canvas 96%, CanvasText 0%); }
+    #board { width: 100%; height: 520px; display: block; }
+    .legend { font-size: 12px; opacity: .8; }
+    .results { margin-top: 8px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+    .note { font-size: 12px; opacity: .7; }
+    .error { color: #c00; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1 style="margin:0;font-size:20px">あみだくじ</h1>
+
+  <div class="panel">
+    <div class="row full">
+      <div>
+        <label for="names">参加者（カンマ区切り）</label>
+        <input id="names" placeholder="例: 佐藤, 鈴木, 高橋">
+      </div>
+      <div>
+        <label for="prizes">結果（カンマ区切り）</label>
+        <input id="prizes" placeholder="例: A賞, B賞, C賞">
+      </div>
+    </div>
+
+    <div>
+      <label for="lines">本数（2〜12）</label>
+      <input id="lines" type="number" min="2" max="12" value="5">
+    </div>
+    <div>
+      <label for="steps">段数（高さ 5〜50）</label>
+      <input id="steps" type="number" min="5" max="50" value="18">
+    </div>
+    <div>
+      <label for="density">横棒の多さ</label>
+      <input id="density" type="range" min="0" max="100" value="35">
+      <div class="legend">少ない ←→ 多い</div>
+    </div>
+    <div class="row full" style="grid-template-columns:auto auto auto 1fr;">
+      <button id="generate">作成/更新</button>
+      <button id="shuffle">横棒をシャッフル</button>
+      <button id="runAll">結果を見る</button>
+      <div id="msg" class="error"></div>
+    </div>
+  </div>
+
+  <div id="wrap">
+    <svg id="board" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" aria-label="あみだくじ盤面"></svg>
+    <div class="note">上の名前をクリックすると経路をハイライトします。</div>
+    <div id="out" class="results"></div>
+  </div>
+
+  <script>
+    const svg = document.getElementById('board');
+    const namesInput = document.getElementById('names');
+    const prizesInput = document.getElementById('prizes');
+    const linesInput = document.getElementById('lines');
+    const stepsInput = document.getElementById('steps');
+    const densityInput = document.getElementById('density');
+    const generateBtn = document.getElementById('generate');
+    const shuffleBtn = document.getElementById('shuffle');
+    const runAllBtn = document.getElementById('runAll');
+    const out = document.getElementById('out');
+    const msg = document.getElementById('msg');
+
+    // State
+    let N = 5;       // number of vertical lines
+    let S = 18;      // number of horizontal layers
+    let grid = [];   // grid[s] = Set of j where bar connects j <-> j+1 (0 <= j < N-1)
+    let names = [];
+    let prizes = [];
+
+    function parseList(s, fallbackCount, makeLabel) {
+      const arr = (s || "")
+        .split(",")
+        .map(x => x.trim())
+        .filter(x => x.length > 0);
+      if (arr.length === 0) {
+        for (let i = 0; i < fallbackCount; i++) arr.push(makeLabel(i));
+      }
+      return arr;
+    }
+
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+    function makeGrid(N, S, density) {
+      const g = Array.from({ length: S }, () => new Set());
+      for (let y = 0; y < S; y++) {
+        let j = 0;
+        while (j < N - 1) {
+          // 近接（隣り合う横棒）禁止
+          if (Math.random() < density) {
+            g[y].add(j);
+            j += 2; // 隣をスキップ
+          } else {
+            j += 1;
+          }
+        }
+      }
+      return g;
+    }
+
+    function layout() {
+      // Compute dynamic size from SVG viewBox
+      const vb = svg.viewBox.baseVal;
+      const W = vb.width, H = vb.height;
+      const padX = 40, padTop = 70, padBot = 70;
+      const innerW = W - padX * 2;
+      const innerH = H - padTop - padBot;
+      const xs = (i) => padX + (N === 1 ? innerW/2 : i * (innerW / (N - 1)));
+      const ys = (k) => padTop + (S === 0 ? innerH/2 : k * (innerH / S));
+      return { W, H, padX, padTop, padBot, innerW, innerH, xs, ys };
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      const { W, H, padTop, padBot, xs, ys } = layout();
+
+      // Background
+      const bg = makeEl('rect', { x: 0, y: 0, width: W, height: H, fill: 'none' });
+      svg.appendChild(bg);
+
+      // Labels group
+      const gLabelsTop = makeEl('g');
+      const gLabelsBot = makeEl('g');
+      svg.appendChild(gLabelsTop);
+      svg.appendChild(gLabelsBot);
+
+      // Lines group
+      const gLines = makeEl('g', { stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round' });
+      svg.appendChild(gLines);
+
+      // Horizontal bars group
+      const gBars = makeEl('g', { stroke: 'currentColor', 'stroke-width': 3, 'stroke-linecap': 'round', opacity: 0.7 });
+      svg.appendChild(gBars);
+
+      // Path group (highlight)
+      const gPath = makeEl('g', { stroke: '#0a84ff', 'stroke-width': 4, 'stroke-linecap': 'round', fill: 'none' });
+      svg.appendChild(gPath);
+
+      // Draw vertical lines and labels
+      for (let i = 0; i < N; i++) {
+        const x = xs(i);
+        const y1 = padTop, y2 = H - padBot;
+        gLines.appendChild(makeEl('line', { x1: x, y1, x2: x, y2, opacity: 0.85 }));
+
+        // Top labels (clickable)
+        const t = makeEl('text', { x, y: 28, 'text-anchor': 'middle', 'font-size': 16, style: 'cursor:pointer;' });
+        t.textContent = names[i] ?? `#${i + 1}`;
+        t.addEventListener('click', () => highlightFrom(i));
+        gLabelsTop.appendChild(t);
+
+        // Bottom labels (results)
+        const b = makeEl('text', { x, y: H - 24, 'text-anchor': 'middle', 'font-size': 15, opacity: 0.9 });
+        b.textContent = prizes[i] ?? `結果${i + 1}`;
+        gLabelsBot.appendChild(b);
+      }
+
+      // Draw horizontal bars
+      for (let y = 0; y < S; y++) {
+        for (const j of grid[y]) {
+          const x1 = xs(j), x2 = xs(j + 1), yv = ys(y + 0.5);
+          gBars.appendChild(makeEl('line', { x1, y1: yv, x2, y2: yv }));
+        }
+      }
+
+      // Store for later path redraw
+      svg._gPath = gPath;
+    }
+
+    function makeEl(tag, attrs = {}) {
+      const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+      return el;
+    }
+
+    function trace(start) {
+      let idx = start;
+      const { xs, ys, padTop, padBot, H } = layout();
+      const pathSegs = [];
+
+      // Start point
+      let cx = xs(idx);
+      let cy = 28 + 10; // below top label
+      pathSegs.push(['M', cx, cy]);
+      pathSegs.push(['L', cx, padTop]);
+
+      // Traverse each step
+      for (let y = 0; y < S; y++) {
+        const yBar = ys(y + 0.5);
+        // Go down to bar level
+        pathSegs.push(['L', cx, yBar]);
+
+        // Check left/right bar
+        if (grid[y].has(idx)) {
+          // right
+          const nx = xs(idx + 1);
+          pathSegs.push(['L', nx, yBar]);
+          idx = idx + 1;
+          cx = nx;
+        } else if (idx - 1 >= 0 && grid[y].has(idx - 1)) {
+          // left
+          const nx = xs(idx - 1);
+          pathSegs.push(['L', nx, yBar]);
+          idx = idx - 1;
+          cx = nx;
+        }
+        // Continue down to next layer top
+        const nextY = (y === S - 1) ? (H - padBot) : ys(y + 1);
+        pathSegs.push(['L', cx, nextY]);
+      }
+
+      // Down to bottom label baseline
+      pathSegs.push(['L', cx, H - 24 - 10]);
+
+      const d = pathSegs.map(seg => `${seg[0]} ${seg[1].toFixed(2)} ${seg[2].toFixed(2)}`).join(' ');
+      return { end: idx, d };
+    }
+
+    function highlightFrom(start) {
+      const { end, d } = trace(start);
+      const gPath = svg._gPath;
+      gPath.innerHTML = "";
+      const path = makeEl('path', { d });
+      gPath.appendChild(path);
+
+      // Pulse animation
+      path.style.filter = 'drop-shadow(0 0 2px #0a84ff)';
+      path.animate([{ opacity: .2 }, { opacity: 1 }], { duration: 300, iterations: 1 });
+      // Show mapping
+      out.textContent = `${(names[start] ?? `#${start + 1}`)} → ${(prizes[end] ?? `結果${end + 1}`)}`;
+    }
+
+    function computeAll() {
+      const pairs = [];
+      for (let i = 0; i < N; i++) {
+        const { end } = trace(i);
+        pairs.push([i, end]);
+      }
+      return pairs;
+    }
+
+    function renderResults() {
+      const pairs = computeAll();
+      const lines = pairs.map(([s, e]) => `${names[s] ?? `#${s + 1}`} → ${prizes[e] ?? `結果${e + 1}`}`);
+      out.textContent = lines.join('\n');
+    }
+
+    function readInputs() {
+      msg.textContent = '';
+      const n = clamp(parseInt(linesInput.value || '5', 10), 2, 12);
+      const s = clamp(parseInt(stepsInput.value || '18', 10), 5, 50);
+      const dens = clamp(parseInt(densityInput.value || '35', 10), 0, 100) / 100;
+
+      const tmpNames = parseList(namesInput.value, n, i => `#${i + 1}`);
+      const tmpPrizes = parseList(prizesInput.value, n, i => `結果${i + 1}`);
+
+      // Resize to N
+      while (tmpNames.length < n) tmpNames.push(`#${tmpNames.length + 1}`);
+      while (tmpPrizes.length < n) tmpPrizes.push(`結果${tmpPrizes.length + 1}`);
+      if (tmpNames.length > n) tmpNames.length = n;
+      if (tmpPrizes.length > n) tmpPrizes.length = n;
+
+      return { n, s, dens, tmpNames, tmpPrizes };
+    }
+
+    function regenerate({ keepBars = false } = {}) {
+      const { n, s, dens, tmpNames, tmpPrizes } = readInputs();
+      N = n; S = s; names = tmpNames; prizes = tmpPrizes;
+      if (!keepBars) grid = makeGrid(N, S, dens);
+      draw();
+      out.textContent = '';
+    }
+
+    // Events
+    generateBtn.addEventListener('click', () => regenerate({ keepBars: false }));
+    shuffleBtn.addEventListener('click', () => regenerate({ keepBars: false }));
+    runAllBtn.addEventListener('click', () => renderResults());
+
+    // Responsive: redraw on resize to keep crisp
+    window.addEventListener('resize', () => { draw(); });
+
+    // First render with defaults
+    regenerate({ keepBars: false });
+  </script>
+</body>
+</html>
